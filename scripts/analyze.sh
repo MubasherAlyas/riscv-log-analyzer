@@ -1,123 +1,189 @@
 
-#!/bin/bash
-
-# RISC-V Log Analyzer
-# Reads simulation logs and counts test results.
-
+#!/usr/bin/env bash
 set -euo pipefail
 
-# Function 1: Display usage instructions
+# RISC-V Simulation Log Analyzer
+# Exit codes: 0 = no failed tests, 1 = failed tests, 2 = usage/input error.
+
 show_help() {
-    echo "Usage: $0 <log_file>"
-    echo "Example: $0 test_data/sample_pass.log"
+    cat <<'HELP'
+Usage: scripts/analyze.sh <log_file> [OPTIONS]
+
+Options:
+  --format text|csv    Output format (default: text)
+  --output PATH        Save report to a file
+  --verbose            Print processing information to stderr
+  --help               Show this help message
+HELP
 }
 
-# Check whether the user supplied a log file
-if [[ $# -eq 0 ]]; then
-    echo "Error: Missing log file argument." >&2
-    show_help
+error() {
+    echo "Error: $*" >&2
     exit 2
+}
+
+FORMAT="text"
+OUTPUT=""
+VERBOSE=false
+LOG_FILE=""
+
+# Parse command-line arguments.
+while (( $# > 0 )); do
+    case "$1" in
+        --help)
+            show_help
+            exit 0
+            ;;
+        --format)
+            (( $# >= 2 )) || error "Missing format value"
+            FORMAT="$2"
+            shift 2
+            ;;
+        --output)
+            (( $# >= 2 )) || error "Missing output path"
+            OUTPUT="$2"
+            shift 2
+            ;;
+        --verbose)
+            VERBOSE=true
+            shift
+            ;;
+        -*)
+            error "Unknown option: $1"
+            ;;
+        *)
+            [[ -z "$LOG_FILE" ]] || error "Multiple log files supplied"
+            LOG_FILE="$1"
+            shift
+            ;;
+    esac
+done
+
+[[ -n "$LOG_FILE" ]] || error "Log file is required"
+[[ -f "$LOG_FILE" && -r "$LOG_FILE" ]] || error "Cannot read $LOG_FILE"
+[[ "$FORMAT" == "text" || "$FORMAT" == "csv" ]] ||
+    error "Format must be text or csv"
+
+# Prevent overwriting the input log.
+if [[ -n "$OUTPUT" ]]; then
+    [[ "$(realpath -m "$OUTPUT")" != "$(realpath "$LOG_FILE")" ]] ||
+        error "Output cannot overwrite input log"
 fi
 
-LOG_FILE="$1"
+$VERBOSE && echo "Processing: $LOG_FILE" >&2
 
-# Check whether the log file exists
-if [[ ! -f "$LOG_FILE" ]]; then
-    echo "Error: File not found: $LOG_FILE" >&2
-    exit 2
-fi
-
-# Function 2: Count PASS, FAIL, and SKIP results
+# Parse completed test records and compute statistics.
 analyze_log() {
-    PASS_COUNT=$(grep -c 'TEST PASS:' "$LOG_FILE" || true)
-    FAIL_COUNT=$(grep -c 'TEST FAIL:' "$LOG_FILE" || true)
-    SKIP_COUNT=$(grep -c 'TEST SKIP:' "$LOG_FILE" || true)
+    awk -v format="$FORMAT" -v logfile="$LOG_FILE" \
+        -v analysis_date="$(date '+%Y-%m-%d %H:%M:%S')" '
+    function pct(n) {
+        return total ? 100 * n / total : 0
+    }
 
-    TOTAL=$((PASS_COUNT + FAIL_COUNT + SKIP_COUNT))
-    
-    # Calculate percentages safely
-    if (( TOTAL > 0 )); then
-        PASS_RATE=$(awk -v p="$PASS_COUNT" -v t="$TOTAL" 'BEGIN {printf "%.1f", (p/t)*100}')
-        FAIL_RATE=$(awk -v f="$FAIL_COUNT" -v t="$TOTAL" 'BEGIN {printf "%.1f", (f/t)*100}')
-        SKIP_RATE=$(awk -v s="$SKIP_COUNT" -v t="$TOTAL" 'BEGIN {printf "%.1f", (s/t)*100}')
-    else
-        PASS_RATE="0.0"
-        FAIL_RATE="0.0"
-        SKIP_RATE="0.0"
-    fi
-
-    echo "=== RISC-V Simulation Log Analysis ==="
-    echo "Log file: $LOG_FILE"
-    echo "Total tests: $TOTAL"
-    
-    echo "Passed: $PASS_COUNT ($PASS_RATE%)"
-    echo "Failed: $FAIL_COUNT ($FAIL_RATE%)"
-    echo "Skipped: $SKIP_COUNT ($SKIP_RATE%)"
-
-    # Display the names of failed tests
-    echo "--- Failed Tests ---"
-
-    if (( FAIL_COUNT > 0 )); then
-        grep 'TEST FAIL:' "$LOG_FILE" |
-            sed -E 's/.*TEST FAIL: ([^ ]+).*/\1/' |
-            awk '{print NR ". " $0}'
-    else
-        echo "None"
-    fi
-}
-
-# Function 3: Extract and summarize test execution times
-analyze_timing() {
-    echo "--- Execution Times ---"
-
-    awk '
     /TEST (PASS|FAIL|SKIP):/ {
-        if (match($0, /TEST (PASS|FAIL|SKIP):/)) {
-            line = substr($0, RSTART + RLENGTH)
-            split(line, parts, " ")
-            name = parts[1]
+        line = $0
+        sub(/^.*TEST /, "", line)
 
-            # Only include tests with numeric execution times
-            if (match(line, /\([0-9]+(\.[0-9]+)?s\)/)) {
-                time_text = substr(line, RSTART + 1, RLENGTH - 3)
-                time = time_text + 0
+        status = line
+        sub(/:.*/, "", status)
 
-                printf "%s: %.2fs\n", name, time
+        name = line
+        sub(/^[^:]+:[[:space:]]*/, "", name)
+        sub(/[[:space:]].*$/, "", name)
 
-                sum += time
-                count++
+        total++
+        names[total] = name
+        statuses[total] = status
 
-                if (count == 1 || time < min) {
-                    min = time
-                    min_name = name
-                }
+        if (status == "PASS") passed++
+        else if (status == "FAIL") {
+            failed++
+            failures[failed] = name
+        }
+        else if (status == "SKIP") skipped++
 
-                if (count == 1 || time > max) {
-                    max = time
-                    max_name = name
-                }
+        duration = ""
+        if (match(line, /\([0-9]+(\.[0-9]+)?s\)/)) {
+            duration = substr(line, RSTART + 1, RLENGTH - 3) + 0
+            times[total] = duration
+            sum += duration
+            timed++
+
+            if (timed == 1 || duration < min) {
+                min = duration
+                min_name = name
+            }
+            if (timed == 1 || duration > max) {
+                max = duration
+                max_name = name
             }
         }
     }
 
     END {
-        print "--- Timing Statistics ---"
+        verdict = failed > 0 ? "FAIL" : "PASS"
 
-        if (count > 0) {
-            printf "Min time: %.2fs (%s)\n", min, min_name
-            printf "Max time: %.2fs (%s)\n", max, max_name
-            printf "Avg time: %.2fs\n", sum / count
+        if (format == "csv") {
+            print "test_name,status,execution_time_seconds"
+            for (i = 1; i <= total; i++) {
+                if (i in times)
+                    printf "%s,%s,%.2f\n", names[i], statuses[i], times[i]
+                else
+                    printf "%s,%s,\n", names[i], statuses[i]
+            }
+            printf "TOTAL,%d,\n", total
+            printf "PASSED,%d,\n", passed
+            printf "FAILED,%d,\n", failed
+            printf "SKIPPED,%d,\n", skipped
+            printf "PASS_RATE,%.1f%%,\n", pct(passed)
+            printf "VERDICT,%s,\n", verdict
         } else {
-            print "No execution time data available"
+            print "=== RISC-V Simulation Log Analysis ==="
+            print "Log file: " logfile
+            print "Analysis date: " analysis_date
+            print "--- Results Summary ---"
+            printf "Total tests: %d\n", total
+            printf "Passed: %d (%.1f%%)\n", passed, pct(passed)
+            printf "Failed: %d (%.1f%%)\n", failed, pct(failed)
+            printf "Skipped: %d (%.1f%%)\n", skipped, pct(skipped)
+
+            print "--- Failed Tests ---"
+            if (failed == 0) print "None"
+            for (i = 1; i <= failed; i++)
+                printf "%d. %s\n", i, failures[i]
+
+            print "--- Execution Times ---"
+            for (i = 1; i <= total; i++)
+                if (i in times)
+                    printf "%s: %.2fs\n", names[i], times[i]
+
+            print "--- Timing Statistics ---"
+            if (timed) {
+                printf "Min time: %.2fs (%s)\n", min, min_name
+                printf "Max time: %.2fs (%s)\n", max, max_name
+                printf "Avg time: %.2fs\n", sum / timed
+            } else {
+                print "No execution time data available"
+            }
+
+            print "--- Verdict: " verdict " ---"
         }
-    }
-    ' "$LOG_FILE"
+    }' "$LOG_FILE"
 }
-analyze_log
-analyze_timing
-# Return failure when any test fails
+
+# Save the report or display it on stdout.
+if [[ -n "$OUTPUT" ]]; then
+    [[ -d "$(dirname "$OUTPUT")" ]] ||
+        error "Output directory does not exist"
+    analyze_log > "$OUTPUT" || error "Report generation failed"
+    $VERBOSE && echo "Report saved: $OUTPUT" >&2
+else
+    analyze_log
+fi
+
+# A failure is a test result, not a parser error.
+FAIL_COUNT=$(grep -c 'TEST FAIL:' "$LOG_FILE" || true)
 if (( FAIL_COUNT > 0 )); then
     exit 1
 fi
-
 exit 0
