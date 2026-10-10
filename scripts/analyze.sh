@@ -66,8 +66,55 @@ analyze_log() {
     fi
 }
 
-analyze_log
+# Function 3: Extract and summarize test execution times
+analyze_timing() {
+    echo "--- Execution Times ---"
 
+    awk '
+    /TEST (PASS|FAIL|SKIP):/ {
+        if (match($0, /TEST (PASS|FAIL|SKIP):/)) {
+            line = substr($0, RSTART + RLENGTH)
+            split(line, parts, " ")
+            name = parts[1]
+
+            # Only include tests with numeric execution times
+            if (match(line, /\([0-9]+(\.[0-9]+)?s\)/)) {
+                time_text = substr(line, RSTART + 1, RLENGTH - 3)
+                time = time_text + 0
+
+                printf "%s: %.2fs\n", name, time
+
+                sum += time
+                count++
+
+                if (count == 1 || time < min) {
+                    min = time
+                    min_name = name
+                }
+
+                if (count == 1 || time > max) {
+                    max = time
+                    max_name = name
+                }
+            }
+        }
+    }
+
+    END {
+        print "--- Timing Statistics ---"
+
+        if (count > 0) {
+            printf "Min time: %.2fs (%s)\n", min, min_name
+            printf "Max time: %.2fs (%s)\n", max, max_name
+            printf "Avg time: %.2fs\n", sum / count
+        } else {
+            print "No execution time data available"
+        }
+    }
+    ' "$LOG_FILE"
+}
+analyze_log
+analyze_timing
 # Return failure when any test fails
 if (( FAIL_COUNT > 0 )); then
     exit 1
