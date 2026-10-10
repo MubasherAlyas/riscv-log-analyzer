@@ -1,1 +1,2 @@
-Report format: HTML
+Supported report formats: TEXT and CSV
+HTML reporting is an optional future enhancement.
